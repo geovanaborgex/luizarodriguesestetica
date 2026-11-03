@@ -2,7 +2,7 @@
 header('Content-Type: application/json; charset=utf-8');
 date_default_timezone_set('America/Sao_Paulo');
 
-require_once __DIR__ . '/procedimentos_service.php';
+require_once __DIR__ . '/procedimentos-service.php';
 
 function responderHorarios(array $dados, int $codigo = 200): void
 {
