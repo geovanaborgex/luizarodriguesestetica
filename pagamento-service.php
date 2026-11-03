@@ -1,6 +1,5 @@
-
 <?php
-require_once __DIR__ . '/procedimentos_service.php';
+require_once __DIR__ . '/procedimentos-service.php';
 
 const PAGAMENTOS_PLANILHA_ID =
     '1qCcyDo4NEWUaX3H66-RpKQb6KttsQAlIzyc5q-9r6Ec';
