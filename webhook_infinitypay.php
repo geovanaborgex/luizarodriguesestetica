@@ -1,6 +1,6 @@
 
 <?php
-require_once __DIR__ . '/pagamento_service.php';
+require_once __DIR__ . '/pagamento-service.php';
 
 date_default_timezone_set('America/Sao_Paulo');
 
