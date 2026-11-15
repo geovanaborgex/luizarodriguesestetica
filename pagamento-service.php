@@ -391,7 +391,7 @@ try {
     );
 
     exibirRetorno(
-        'Não foi possível confirmar agora',
-        'Não tente realizar outro pagamento. Entre em contato com o salão para verificar a situação do seu agendamento.'
+        'Erro no diagnóstico',
+        'Detalhe técnico: ' . $e->getMessage()
     );
 }
