@@ -1,385 +1,326 @@
+
 <?php
-require_once __DIR__ . '/procedimentos-service.php';
+require_once __DIR__ . '/pagamento-service.php';
 
-const PAGAMENTOS_PLANILHA_ID =
-    '1qCcyDo4NEWUaX3H66-RpKQb6KttsQAlIzyc5q-9r6Ec';
-
-const PAGAMENTOS_CALENDAR_ID = 'luizagues99@gmail.com';
-
-function pagamentoResponder(
-    array $dados,
-    int $codigo = 200
-): void {
-    http_response_code($codigo);
-    header('Content-Type: application/json; charset=utf-8');
-
-    echo json_encode(
-        $dados,
-        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-    );
-}
-
-function pagamentoSheets(): Google_Service_Sheets
-{
-    global $client;
-
-    return new Google_Service_Sheets($client);
-}
-
-function pagamentoBuscarPedido(string $pedidoId): array
-{
-    $sheets = pagamentoSheets();
-
-    $resposta = $sheets->spreadsheets_values->get(
-        PAGAMENTOS_PLANILHA_ID,
-        "'Pagamentos'!A2:N"
-    );
-
-    $linhas = $resposta->getValues() ?? [];
-
-    foreach ($linhas as $indice => $linha) {
-        if (trim((string)($linha[0] ?? '')) === $pedidoId) {
-            return [
-                'linha' => $indice + 2,
-                'dados' => array_pad($linha, 14, '')
-            ];
-        }
-    }
-
-    throw new RuntimeException('Pedido não encontrado.');
-}
-
-function pagamentoAtualizarPedido(
-    int $linha,
-    array $pedido,
-    string $status,
-    string $slug = '',
-    string $transacao = '',
-    string $comprovante = ''
-): void {
-    $sheets = pagamentoSheets();
-
-    $valores = [
-        $status,
-        $pedido[10] ?? '',
-        $slug !== '' ? $slug : ($pedido[11] ?? ''),
-        $transacao !== '' ? $transacao : ($pedido[12] ?? ''),
-        $comprovante !== '' ? $comprovante : ($pedido[13] ?? '')
-    ];
-
-    $corpo = new Google_Service_Sheets_ValueRange([
-        'values' => [$valores]
-    ]);
-
-    $sheets->spreadsheets_values->update(
-        PAGAMENTOS_PLANILHA_ID,
-        "'Pagamentos'!J{$linha}:N{$linha}",
-        $corpo,
-        ['valueInputOption' => 'RAW']
-    );
-}
-
-function pagamentoConsultarInfinitePay(
-    string $pedidoId,
-    string $slug,
-    string $transacao
-): array {
-    $handle = trim((string)getenv('INFINITEPAY_HANDLE'));
-
-    if ($handle === '' || $slug === '' || $transacao === '') {
-        throw new RuntimeException(
-            'Dados insuficientes para validar o pagamento.'
-        );
-    }
-
-    if (!function_exists('curl_init')) {
-        throw new RuntimeException('cURL não está disponível.');
-    }
-
-    $payload = [
-        'handle' => $handle,
-        'order_nsu' => $pedidoId,
-        'transaction_nsu' => $transacao,
-        'slug' => $slug
-    ];
-
-    $curl = curl_init(
-        'https://api.checkout.infinitepay.io/payment_check'
-    );
-
-    curl_setopt_array($curl, [
-        CURLOPT_POST => true,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [
-            'Content-Type: application/json',
-            'Accept: application/json'
-        ],
-        CURLOPT_POSTFIELDS => json_encode($payload),
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT => 20
-    ]);
-
-    $resposta = curl_exec($curl);
-    $erro = curl_error($curl);
-    $codigo = (int)curl_getinfo($curl, CURLINFO_HTTP_CODE);
-
-    curl_close($curl);
-
-    if ($resposta === false || $erro !== '') {
-        throw new RuntimeException(
-            'Não foi possível consultar a InfinitePay.'
-        );
-    }
-
-    $dados = json_decode($resposta, true);
-
-    if (
-        $codigo < 200 ||
-        $codigo >= 300 ||
-        !is_array($dados)
-    ) {
-        throw new RuntimeException(
-            'A InfinitePay não retornou uma validação válida.'
-        );
-    }
-
-    return $dados;
-}
-
-function pagamentoConfirmar(
-    string $pedidoId,
-    string $slug,
-    string $transacao,
-    string $comprovante = ''
-): array {
-    if (
-        $pedidoId === '' ||
-        !preg_match('/^[A-Za-z0-9_-]{1,100}$/', $pedidoId)
-    ) {
-        throw new InvalidArgumentException('Pedido inválido.');
-    }
-
-    $registro = pagamentoBuscarPedido($pedidoId);
-    $linha = $registro['linha'];
-    $pedido = $registro['dados'];
-
-    $statusAtual = strtoupper(trim((string)$pedido[9]));
-
-    if ($statusAtual === 'CONFIRMADO') {
-        return [
-            'sucesso' => true,
-            'mensagem' => 'Este agendamento já foi confirmado.'
-        ];
-    }
-
-    // Só processa pedidos que realmente foram registrados
-    // pelo criar_pagamento.php.
-    if (!in_array($statusAtual, ['PENDENTE', 'PAGO'], true)) {
-        return [
-            'sucesso' => false,
-            'mensagem' => 'O pedido não está disponível para confirmação.'
-        ];
-    }
-
-    $verificacao = pagamentoConsultarInfinitePay(
-        $pedidoId,
-        $slug,
-        $transacao
-    );
-
-    if (
-        ($verificacao['success'] ?? false) !== true ||
-        ($verificacao['paid'] ?? false) !== true
-    ) {
-        return [
-            'sucesso' => false,
-            'mensagem' => 'O pagamento ainda não foi confirmado.'
-        ];
-    }
-
-    $valorEsperado = (int)$pedido[8];
-
-    if (
-        $valorEsperado <= 0 ||
-        !isset($verificacao['amount']) ||
-        (int)$verificacao['amount'] !== $valorEsperado
-    ) {
-        pagamentoAtualizarPedido(
-            $linha,
-            $pedido,
-            'DIVERGENCIA_VALOR',
-            $slug,
-            $transacao,
-            $comprovante
-        );
-
-        return [
-            'sucesso' => false,
-            'mensagem' => 'O valor do pagamento precisa ser conferido.'
-        ];
-    }
-
-    // Impede a criação do evento caso a data seja inválida
-    // ou já tenha passado.
-    $data = trim((string)$pedido[5]);
-    $horario = trim((string)$pedido[6]);
-
-    $fuso = new DateTimeZone('America/Sao_Paulo');
-    $inicio = DateTime::createFromFormat(
-        '!Y-m-d H:i',
-        "$data $horario",
-        $fuso
-    );
-
-    if (
-        !$inicio ||
-        $inicio->format('Y-m-d H:i') !== "$data $horario" ||
-        $inicio <= new DateTime('now', $fuso)
-    ) {
-        pagamentoAtualizarPedido(
-            $linha,
-            $pedido,
-            'PAGO_REVISAR_HORARIO',
-            $slug,
-            $transacao,
-            $comprovante
-        );
-
-        return [
-            'sucesso' => false,
-            'mensagem' =>
-                'Pagamento localizado, mas o horário precisa ser revisado.'
-        ];
-    }
-
-    $nomes = json_decode(
-        (string)$pedido[4],
-        true
-    );
-
-    if (!is_array($nomes) || count($nomes) === 0) {
-        throw new RuntimeException(
-            'A lista de procedimentos do pedido está inválida.'
-        );
-    }
-
-    $itens = buscarProcedimentosAtivos($nomes);
-
-    $duracao = 0;
-    $valorTotal = 0;
-
-    foreach ($itens as $item) {
-        $duracao += (int)$item['duracao'];
-        $valorTotal += (float)$item['valor'];
-    }
-
-    $fim = clone $inicio;
-    $fim->modify("+{$duracao} minutes");
-
-    global $service;
-
-    $calendarId = PAGAMENTOS_CALENDAR_ID;
-
-    $eventos = $service->events->listEvents($calendarId, [
-        'timeMin' => $inicio->format(DateTime::RFC3339),
-        'timeMax' => $fim->format(DateTime::RFC3339),
-        'singleEvents' => true,
-        'orderBy' => 'startTime'
-    ]);
-
-    $marcador = 'Pedido InfinitePay: ' . $pedidoId;
-
-    foreach ($eventos->getItems() as $eventoExistente) {
-        $descricaoExistente =
-            (string)$eventoExistente->getDescription();
-
-        // Se uma tentativa anterior já criou o evento,
-        // não cria outro para o mesmo pedido.
-        if (strpos($descricaoExistente, $marcador) !== false) {
-            pagamentoAtualizarPedido(
-                $linha,
-                $pedido,
-                'CONFIRMADO',
-                $slug,
-                $transacao,
-                $comprovante
-            );
-
-            return [
-                'sucesso' => true,
-                'mensagem' => 'Agendamento já registrado.'
-            ];
-        }
-
-        $inicioExistente = $eventoExistente->getStart()->getDateTime();
-        $fimExistente = $eventoExistente->getEnd()->getDateTime();
-
-        if (!$inicioExistente || !$fimExistente) {
-            continue;
-        }
-
-        $inicioExistente = new DateTime($inicioExistente);
-        $fimExistente = new DateTime($fimExistente);
-
-        if ($inicio < $fimExistente && $fim > $inicioExistente) {
-            pagamentoAtualizarPedido(
-                $linha,
-                $pedido,
-                'PAGO_HORARIO_OCUPADO',
-                $slug,
-                $transacao,
-                $comprovante
-            );
-
-            return [
-                'sucesso' => false,
-                'mensagem' =>
-                    'Pagamento identificado, mas o horário está ocupado. É necessária uma revisão manual.'
-            ];
-        }
-    }
-
-    $nome = trim((string)$pedido[2]);
-    $telefone = trim((string)$pedido[3]);
-    $lista = implode(
-        ' + ',
-        array_column($itens, 'procedimento')
-    );
-
-    $evento = new Google_Service_Calendar_Event([
-        'summary' => $lista . ' - ' . $nome,
-        'description' =>
-            "Cliente: {$nome}\n" .
-            "Telefone: {$telefone}\n" .
-            "Procedimentos: {$lista}\n" .
-            'Valor total: R$ ' .
-            number_format($valorTotal, 2, ',', '.') . "\n" .
-            "Tempo total: {$duracao} minutos\n" .
-            $marcador,
-        'start' => [
-            'dateTime' => $inicio->format(DateTime::RFC3339),
-            'timeZone' => 'America/Sao_Paulo'
-        ],
-        'end' => [
-            'dateTime' => $fim->format(DateTime::RFC3339),
-            'timeZone' => 'America/Sao_Paulo'
+if (isset($_GET['teste']) && $_GET['teste'] === '1') {
+    $pedido = [
+        'linha' => 2,
+        'dados' => [
+            'TESTE123',
+            date('c'),
+            'Cliente Teste',
+            '37999999999',
+            '["Design Simples", "Manutenção"]',
+            '2026-11-20',
+            '15:30',
+            50000,
+            10000,
+            'CONFIRMADO',
+            '',
+            '',
+            '',
+            ''
         ]
-    ]);
+    ];
 
-    // Primeiro cria o evento; só depois marca como confirmado.
-    $service->events->insert($calendarId, $evento);
+    $pedido = $pedido['dados'];
 
-    pagamentoAtualizarPedido(
-        $linha,
-        $pedido,
-        'CONFIRMADO',
+    // Continue aqui com a montagem da página de confirmação.
+}
+
+date_default_timezone_set('America/Sao_Paulo');
+
+function escapar(string $valor): string {
+    return htmlspecialchars($valor, ENT_QUOTES, 'UTF-8');
+}
+
+function exibirRetorno(
+    string $titulo,
+    string $mensagem,
+    string $tipo = 'erro',
+    string $botao = '',
+    string $link = ''
+): void {
+    $cor = $tipo === 'sucesso' ? '#6B6E55' : '#C9A86A';
+
+    echo '<!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>' . escapar($titulo) . '</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                background: #f7f6f2;
+                font-family: Arial, sans-serif;
+                color: #444;
+            }
+            .card {
+                background: white;
+                max-width: 440px;
+                width: 100%;
+                padding: 35px 25px;
+                border-radius: 16px;
+                text-align: center;
+                box-shadow: 0 5px 25px rgba(0,0,0,.07);
+            }
+            .icone {
+                font-size: 52px;
+                margin-bottom: 15px;
+            }
+            h1 {
+                color: ' . $cor . ';
+                font-size: 25px;
+            }
+            p {
+                line-height: 1.6;
+                color: #666;
+            }
+            .botao {
+                display: block;
+                margin-top: 25px;
+                padding: 16px;
+                background: #25D366;
+                color: white;
+                text-decoration: none;
+                border-radius: 9px;
+                font-weight: bold;
+            }
+            .detalhes {
+                background: #f7f6f2;
+                padding: 15px;
+                border-radius: 10px;
+                text-align: left;
+                margin-top: 20px;
+                line-height: 1.8;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icone">' .
+                ($tipo === 'sucesso' ? '✓' : 'ℹ') .
+            '</div>
+            <h1>' . escapar($titulo) . '</h1>
+            <p>' . escapar($mensagem) . '</p>';
+
+    if ($link !== '') {
+        echo '<a class="botao" href="' . escapar($link) .
+             '" target="_blank" rel="noopener noreferrer">' .
+             escapar($botao) .
+             '</a>';
+    }
+
+    echo '</div></body></html>';
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    exibirRetorno(
+        'Acesso inválido',
+        'Não foi possível processar esta solicitação.'
+    );
+}
+
+$pedidoId = trim((string)($_GET['order_nsu'] ?? ''));
+$slug = trim((string)($_GET['slug'] ?? ''));
+$transacao = trim((string)($_GET['transaction_nsu'] ?? ''));
+$comprovante = trim((string)($_GET['receipt_url'] ?? ''));
+
+try {
+    $resultado = pagamentoConfirmar(
+        $pedidoId,
         $slug,
         $transacao,
         $comprovante
     );
 
-    return [
-        'sucesso' => true,
-        'mensagem' => 'Pagamento validado e agendamento confirmado.'
-    ];
+    if (!($resultado['sucesso'] ?? false)) {
+        exibirRetorno(
+            'Pagamento em processamento',
+            $resultado['mensagem'] ??
+            'Não foi possível confirmar o pagamento. Entre em contato com o salão antes de tentar pagar novamente.'
+        );
+    }
+
+    // Recupera os dados do pedido já salvo na planilha.
+    $registro = pagamentoBuscarPedido($pedidoId);
+    $pedido = $registro['dados'];
+
+    // Confere novamente o status registrado.
+    if (strtoupper(trim((string)$pedido[9])) !== 'CONFIRMADO') {
+        exibirRetorno(
+            'Pagamento em processamento',
+            'Seu pagamento ainda está sendo confirmado. Entre em contato com o salão antes de tentar pagar novamente.'
+        );
+    }
+
+    $nome = trim((string)$pedido[2]);
+    $telefone = trim((string)$pedido[3]);
+
+    $procedimentos = json_decode(
+        (string)$pedido[4],
+        true
+    );
+
+    if (!is_array($procedimentos)) {
+        $procedimentos = [];
+    }
+
+    $data = trim((string)$pedido[5]);
+    $horario = trim((string)$pedido[6]);
+
+    $dataFormatada = date(
+        'd/m/Y',
+        strtotime($data)
+    );
+
+    $valorTotal = 'R$ ' . number_format(
+            ((int)$pedido[7]) / 100,
+            2,
+            ',',
+            '.'
+        );
+
+    $valorSinal = 'R$ ' . number_format(
+            ((int)$pedido[8]) / 100,
+            2,
+            ',',
+            '.'
+        );
+
+    $listaProcedimentos = implode(', ', $procedimentos);
+
+    $mensagem = "Olá, Luiza! Acabei de realizar o pagamento do sinal do meu agendamento pelo site.\n\n"
+        . "Cliente: {$nome}\n"
+        . "Telefone: {$telefone}\n"
+        . "Procedimento: {$listaProcedimentos}\n"
+        . "Data: {$dataFormatada}\n"
+        . "Horário: {$horario}\n"
+        . "Valor total dos procedimentos: {$valorTotal}\n"
+        . "Sinal pago antecipadamente (20%): {$valorSinal}\n\n"
+        . "Gostaria de confirmar que está tudo certo. Obrigada!";
+
+    $numeroLuiza = '5537999049543';
+
+    $linkWhatsApp = 'https://wa.me/' .
+        $numeroLuiza .
+        '?text=' .
+        rawurlencode($mensagem);
+
+    echo '<!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Agendamento confirmado</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                background: #f7f6f2;
+                font-family: Arial, sans-serif;
+                color: #444;
+            }
+            .card {
+                background: white;
+                max-width: 460px;
+                width: 100%;
+                padding: 35px 25px;
+                border-radius: 16px;
+                text-align: center;
+                box-shadow: 0 5px 25px rgba(0,0,0,.07);
+            }
+            .icone {
+                width: 65px;
+                height: 65px;
+                border-radius: 50%;
+                background: #e8eee3;
+                color: #6B6E55;
+                font-size: 40px;
+                line-height: 65px;
+                margin: 0 auto 15px;
+            }
+            h1 {
+                color: #6B6E55;
+                font-size: 25px;
+            }
+            p {
+                color: #666;
+                line-height: 1.6;
+            }
+            .detalhes {
+                background: #f7f6f2;
+                padding: 16px;
+                border-radius: 10px;
+                text-align: left;
+                margin-top: 22px;
+                line-height: 1.8;
+                font-size: 14px;
+            }
+            .botao {
+                display: block;
+                margin-top: 25px;
+                padding: 16px;
+                background: #25D366;
+                color: white;
+                text-decoration: none;
+                border-radius: 9px;
+                font-weight: bold;
+            }
+            .observacao {
+                font-size: 12px;
+                margin-top: 15px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icone">✓</div>
+            <h1>Pagamento confirmado!</h1>
+            <p>Seu pagamento foi aprovado e seu agendamento está confirmado. Estamos esperando por você!</p>
+
+            <div class="detalhes">
+                <strong>Confira seu agendamento:</strong><br>
+                Cliente: ' . escapar($nome) . '<br>
+                Procedimento: ' . escapar($listaProcedimentos) . '<br>
+                Data: ' . escapar($dataFormatada) . '<br>
+                Horário: ' . escapar($horario) . '<br>
+                Valor total: ' . escapar($valorTotal) . '<br>
+                Sinal pago antecipadamente (20%): <strong>' . escapar($valorSinal) . '</strong>
+            </div>
+
+            <p>Agora, se desejar, envie uma mensagem para a Luiza pelo WhatsApp informando que realizou o pagamento.</p>
+
+            <a class="botao" href="' . escapar($linkWhatsApp) . '" target="_blank" rel="noopener noreferrer">
+                Enviar confirmação para Luiza pelo WhatsApp
+            </a>
+
+            <p class="observacao">Basta clicar no botão e enviar a mensagem pelo WhatsApp.</p>
+        </div>
+    </body>
+    </html>';
+
+} catch (Throwable $e) {
+    error_log(
+        'Erro no retorno InfinitePay: ' . $e->getMessage()
+    );
+
+    exibirRetorno(
+        'Não foi possível confirmar agora',
+        'Não tente realizar outro pagamento. Entre em contato com o salão para verificar a situação do seu agendamento.'
+    );
 }
